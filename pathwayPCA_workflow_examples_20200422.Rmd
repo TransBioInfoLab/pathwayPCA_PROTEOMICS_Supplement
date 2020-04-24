@@ -1,0 +1,1520 @@
+---
+title: "PathwayPCA: an R/Bioconductor Package for Pathway-Based Integrative Analysis of Multi-Omics Data"
+subtitle: "Analysis Scripts and Workflow to Replicate Examples"
+author: "Gabriel Odom"
+date: "4/17/2020"
+output:
+  word_document:
+    toc: true
+    reference_docx: word_markdown_template.docx
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+```
+
+# Overview
+This document shows the entire analysis workflow for the examples in the main manuscript, following the subsections Section 3:
+
+<ol start = "2">
+  <li> 3.2 A WikiPathways analysis of CPTAC ovarian cancer protein expression data </li>
+  <li> 3.3 An integrative pathway analysis of gene expression and protein expression data for ovarian cancer </li>
+  <li> 3.4 Integrating gene expression data with experimental design information: an analysis of sex-specific pathway gene expression effects on kidney cancer </li>
+  <li> 3.5 A pathway based integrative prediction model for patient prognosis </li>
+</ol>
+
+Names, descriptions, file names, and sources for all data sets can be accessed from `extdata/README` at <https://github.com/TransBioInfoLab/pathwayPCA_PROTEOMICS_Supplement>. 
+
+
+
+*******************************************************************************
+
+</br>
+
+# 3.2 A WikiPathways analysis of CPTAC ovarian cancer protein expression data
+
+## Data Import and Setup
+For this section, we will need the following packages:
+```{r packLoad3.2, message=FALSE}
+library(impute)
+library(tidyverse)
+library(pathwayPCA)
+```
+
+We import the raw data:
+```{r, message=FALSE}
+# Proteomics
+ovarianProtPNNL_tbldf <- read_delim(
+  "extdata/Human_TCGA_OV_PNNL_Proteome_Velos_QExact_01_28_2016_PNNL_Gene_CDAP_iTRAQ_UnsharedLogRatio_r2.cct",
+  "\t", escape_double = FALSE, trim_ws = TRUE
+)
+
+# Clinical Response
+ovarianPheno_tbldf <- read_delim(
+  "extdata/Human_TCGA_OV_MS_Clinical_Clinical_01_28_2016_BI_Clinical_Firehose.tsi",
+  "\t", escape_double = FALSE, trim_ws = TRUE
+)
+```
+
+We also import the WikiPathways pathway collection used at the time of original analysis, translated from Entrez Gene IDs to Gene Symbols.
+```{r}
+human_PC <- read_gmt(
+  "extdata/wikipathways_human_symbol.gmt",
+  description = TRUE
+)
+human_PC
+```
+
+
+## Join and Clean the Data
+Many of the recorded protein values are missing, so we need to remove proteins and subjects with high missing proportions and impute the remaining missing values.
+
+### Join Data
+We transpose the data from $p \times n$ to $n \times p$ form and then join the clinical to the proteomic data.
+```{r}
+# Proteomics
+ovarianProtT_df <- 
+  ovarianProtPNNL_tbldf %>% 
+  TransposeAssay()
+rm(ovarianProtPNNL_tbldf)
+
+# Clinical Response
+ovarianSurv_df <-
+  ovarianPheno_tbldf %>% 
+  TransposeAssay() %>% 
+  mutate(OS_time = as.numeric(overall_survival)) %>% 
+  mutate(OS_event = as.numeric(status)) %>% 
+  select(Sample, OS_time, OS_event)
+rm(ovarianPheno_tbldf)
+
+# Join
+ovarian_df <- inner_join(ovarianSurv_df, ovarianProtT_df)
+rm(ovarianSurv_df, ovarianProtT_df)
+```
+
+
+### Check Data Missingness
+We have 84 samples, but one is missing survival response:
+```{r}
+badSampleIDs_char <- 
+  ovarian_df %>% 
+  select(Sample, OS_time, OS_event) %>% 
+  filter(!complete.cases(.)) %>% 
+  pull(Sample)
+
+badSampleIDs_char
+```
+
+Without this sample, the overall missingness is
+```{r}
+ovarian_df %>% 
+  filter(!(Sample %in% badSampleIDs_char)) %>% 
+  is.na() %>% 
+  mean
+```
+We remove any proteins that have missingness higher than the 80th percentile of missingness in the data set (about 30%).
+```{r}
+pctMissing_num <-
+  ovarian_df %>% 
+  filter(!(Sample %in% badSampleIDs_char)) %>% 
+  map_dbl(
+    ~{ mean(is.na(.x)) }
+  )
+
+quantile(pctMissing_num, 0.8)
+dropProteins_idx <- which(pctMissing_num > 0.2891566)
+
+ovarianTrim_df <-
+  ovarian_df %>% 
+  filter(!(Sample %in% badSampleIDs_char)) %>% 
+  select(-dropProteins_idx)
+```
+<!-- # NOTE: this result is highly sensitive to the threshold. Because this decimal -->
+<!-- #   represents a fraction, this threshold is the difference between 24 / 83 -->
+<!-- #   missing observations or 25 / 83 missing observations. Because our original -->
+<!-- #   code used the value "0.2891566" (24 / 83 to 7 decimal places) instead of -->
+<!-- #   the full fraction (which is a repeating decimal at 41 decimal places), this -->
+<!-- #   resulted in us keeping 5162 / 6475 proteins instead of the more accurate -->
+<!-- #   5277 / 6475 proteins. To maintain congruency with the original analysis, we -->
+<!-- #   will continue to use the approximation (which allows for 23 of the 83 values -->
+<!-- #   to be missing). -->
+
+With this sample and these proteins removed, the overall missingness drops to a touch under 5% (which we believe will be safe to impute).
+```{r}
+ovarianTrim_df %>% 
+  is.na() %>% 
+  mean
+
+rm(ovarian_df, badSampleIDs_char, dropProteins_idx, pctMissing_num)
+```
+
+
+## Impute Missing Values
+We perform imputation via the [impute](https://www.bioconductor.org/packages/devel/bioc/manuals/impute/man/impute.pdf) package on Bioconductor. This method uses k-Nearest-Neighbors. The `impute.knn()` function requires a gene matrix in $p \times n$ form, so we transpose, impute, then transpose back.
+```{r message=FALSE, }
+ovarianProtClean_df <- 
+  ovarianTrim_df %>% 
+  # Remove clinical data
+  select(-Sample, -OS_time, -OS_event) %>% 
+  # transpose and coerce to a matrix
+  t() %>% 
+  # impute with kNN
+  impute.knn() %>% 
+  # extract the imputed data
+  pluck("data") %>% 
+  # promote to data frame
+  as.data.frame() %>%
+  # transpose as a data frame
+  TransposeAssay(omeNames = "rowNames") %>% 
+  # Re-attach clinical data
+  bind_cols(
+    select(ovarianTrim_df, Sample, OS_time, OS_event),
+    .
+  )
+  
+anyNA(ovarianProtClean_df)
+rm(ovarianTrim_df)
+```
+
+
+## AES-PCA Analysis
+Now that we have clean data, we can create an `Omics*` data container and perform the AES-PCA analysis.
+
+### Data Container
+```{r 3.2_ovProtOmics_WP}
+ovProt_OmicsSurv <- CreateOmics(
+  assayData_df = ovarianProtClean_df[, -(2:3)],
+  pathwayCollection_ls = human_PC,
+  response = ovarianProtClean_df[, 1:3],
+  respType = "survival"
+)
+
+ovProt_OmicsSurv
+```
+
+### AES-PCA
+We have roughly 350 pathways to test, and this takes about two minutes with parallel computing. Methods for false discovery rate adjustments can be passed to the `adjustment` argument (each method supplied will add a column to the results table).
+<!-- Note that AES-PCA results from the LARS algorithm are not unique in all cases (and may be not numerically unique even in full-rank cases), so pathway $p$-values may be different across multiple runs of this function (see Tibshirani's [white paper](https://www.stat.cmu.edu/~ryantibs/papers/lassounique.pdf) on this topic). As with other results built on algorithms similar to the elastic net or LARS, you may want to execute the code a few times to inspect the stability of the estimated PCs (not necessarily the rankings of the pathways, which can often depend on the ten-thousandths place of a $p$-value). -->
+```{r 3.2_ovProtAESPCA_WP}
+ovProt_aespcOut <- AESPCA_pVals(
+  ovProt_OmicsSurv,
+  numPCs = 1,
+  parallel = TRUE,
+  numCores = 16,
+  adjustment = "BH"
+)
+```
+<!-- 9.03 min on mac -->
+
+
+## Inspect the Results
+We will inspect the top most significant pathways, extract data from a specific pathway, and inspect the protein loadings and subject pathway scores from that pathway.
+
+### Top Pathways
+We use the `getPathpVals()` function to look at the top most significant pathways. Note that the $p$-values from these top pathways are can vary slightly (because the estimated first principal component from each pathway can vary slightly depending on the convergence of the adaptive, elastic-net, sparse PCA algorithm). But the differences in $p$-values are usually small, and differ only in the third or fourth decimals. As a result, the ranking order of the pathways in this workflow is slightly different from those described in main manuscript.
+```{r}
+# Use kable for pretty tables
+getPathpVals(ovProt_aespcOut, numPaths = 10L) %>% 
+  knitr::kable()
+```
+
+### Pathway Data Subset
+We see that the "IL-1 Signalling Pathway" is abbreviated by the WikiPathways code "WP195". Thus, we can extract the protein data specific to this pathway with the `SubsetPathwayData()` function.
+```{r}
+il1Signal_df <- SubsetPathwayData(ovProt_OmicsSurv, "WP195")
+
+dim(il1Signal_df)
+il1Signal_df[1:5, 1:5]
+```
+
+### Loadings and Scores 
+We now extract the principal component loadings and scores for this pathway.
+```{r}
+wp195PCA_ls <- getPathPCLs(ovProt_aespcOut, "WP195")
+```
+
+#### Subject-Specific Pathway Estimates
+```{r}
+ggplot(wp195PCA_ls$PCs) + 
+  aes(x = V1) + 
+  geom_histogram(
+    binwidth = 1,
+    colour = "black",
+    fill = "white"
+  )
+```
+
+
+#### Protein Loadings within a Pathway
+```{r}
+ggplot(
+  wp195PCA_ls$Loadings %>% 
+    filter(PC1 != 0) 
+) + 
+  theme(axis.text.x = element_text(angle = -45, hjust = 0, vjust = 0.5)) +
+  aes(x = reorder(featureID, -PC1), y = PC1) +
+  geom_col()
+
+rm(wp195PCA_ls)
+```
+
+
+## Changing the Pathway Collection
+We can also analyze this same data with pathways in the GSEA Molecular Signatures Database.
+
+### Re-Build the Data Container
+Because we change the pathway collection, the features retained in the assay will also change.
+```{r 3.2_ovProtOmics_C2CP}
+c2cp_PC <- read_gmt(
+  "extdata/c2.cp.v6.2.symbols.gmt",
+  description = TRUE
+)
+
+ovProt_OmicsSurv <- CreateOmics(
+  assayData_df = ovarianProtClean_df[, -(2:3)],
+  pathwayCollection_ls = c2cp_PC,
+  response = ovarianProtClean_df[, 1:3],
+  respType = "survival"
+)
+
+ovProt_OmicsSurv
+```
+
+<!-- Using the WikiPathways collection, there were 363 of the 457 pathways retained, which act as groupings for 2078 of the 5162 features. Now we see that there are 1236 of the 1329 pathways retained, which act as groupings for 2981 of the 5162 features. While this means that more features will be included in the analysis, this also increases the number of pathways tested nearly four-fold. This means that pathways that may be significantly related to ovarian cancer survival may not pass the adjustment for false discovery rate. -->
+
+### Updated AES-PCA Analysis
+Let's compute the PCs for this pathway collection and inspect the top pathways. (As we noted previously, this pathway collection is nearly four times larger, so this computation takes four times longer.)
+```{r 3.3_ovProtAESPCA_C2CP}
+ovProt_aespcOut <- AESPCA_pVals(
+  ovProt_OmicsSurv,
+  numPCs = 1,
+  parallel = TRUE,
+  numCores = 16,
+  adjustment = "BH"
+)
+```
+<!-- 36.22 min on mac -->
+
+The top pathways of the C2 Canonical Pathways collection are:
+```{r}
+getPathpVals(ovProt_aespcOut, numPaths = 10L) %>% 
+  mutate(terms = str_trunc(terms, 45)) %>% 
+  select(terms, rawp) %>% 
+  knitr::kable()
+```
+
+
+
+*******************************************************************************
+
+</br>
+
+# 3.3 An integrative pathway analysis of gene expression and protein expression data for ovarian cancer
+Given the ovarian cancer proteomics results in Section 3.2 (using the C2 CP collection), we additionally analyze the gene expression data for this integrative analysis. 
+
+## Data Import, Wrangling, Cleaning, and Joining
+We import the raw gene expression RNAseq - IlluminaHiSeq pancan normalized data:
+```{r, message=FALSE}
+# RNAseq
+ovarianRNAseq_tbldf <- read_delim(
+  "extdata/HiSeqV2_PANCAN",
+  "\t", escape_double = FALSE, trim_ws = TRUE
+)
+
+# Clinical Response
+ovarianPheno_tbldf <- read_delim(
+  "extdata/Human_TCGA_OV_MS_Clinical_Clinical_01_28_2016_BI_Clinical_Firehose.tsi",
+  "\t", escape_double = FALSE, trim_ws = TRUE
+)
+```
+
+<!-- We offer the following comment: at the time of this analysis, the RNAseq data from the LinkedOmics repository has two fewer gene expression samples than the Xena Browser. The missing samples are "TCGA.13.1489" and "TCGA.31.1950". This is why we use the gene expression data from Xena instead. -->
+As before, we transpose the data and join.
+<!-- Because the gene expression data is drawn from the Xena repository, the sample IDs for RNAseq data has 12 digits and are delimitted by dashes. In comparison, the clinical data and proteomics sample IDs from the LinkedOmics repository have 10 digits and are delimitted by full stops. Additionally, four of the 12-digit sample IDs end in "-02", which means that Xena kept secondary secondary samples from the same subject. We want to retain only one sample (preferring primary samples), so we remove any secondary sample if we already have a primary one. -->
+```{r}
+# RNAseq
+ovarianRNAseqT_df <- 
+  ovarianRNAseq_tbldf %>% 
+  TransposeAssay() %>% 
+  # detect if the sample is a primary sample
+  mutate(primary = str_detect(Sample, pattern = "\\w*01\\b")) %>% 
+  # remove the sample number 
+  mutate(Sample = str_sub(Sample, end = -4)) %>% 
+  # detect if samples are duplicated
+  mutate(duplicate = duplicated(Sample)) %>% 
+  # mark if the sample is a primary sample or is not duplicated
+  mutate(keep = primary | !duplicate) %>% 
+  # remove the rows that don't meet our qualifications
+  filter(keep) %>% 
+  # remove these "working" columns
+  select(-primary, -duplicate, -keep) %>% 
+  # replace the dashes with full stops in the sample IDs
+  mutate(
+    Sample = str_replace_all(Sample, pattern = "-", replacement = ".")
+  ) 
+
+rm(ovarianRNAseq_tbldf)
+
+# Clinical Response
+ovarianSurv_df <-
+  ovarianPheno_tbldf %>% 
+  TransposeAssay() %>% 
+  mutate(OS_time = as.numeric(overall_survival)) %>% 
+  mutate(OS_event = as.numeric(status)) %>% 
+  select(Sample, OS_time, OS_event) %>% 
+  drop_na()
+rm(ovarianPheno_tbldf)
+
+# Join
+ovarianRNAseq_df <- inner_join(ovarianSurv_df, ovarianRNAseqT_df)
+rm(ovarianSurv_df, ovarianRNAseqT_df)
+```
+
+<!-- The corresponding code to analyse the gene expression data as hosted by LinkedOmics is (it is cleaner code because we don't have to transform barcodes): -->
+<!-- ```{r, eval=FALSE} -->
+<!-- # DO NOT RUN -->
+
+<!-- ovarianRNAseq2_tbldf <- read_delim( -->
+<!--   "extdata/Human__TCGA_OV__UNC__RNAseq__HiSeq_RNA__01_28_2016__BI__Gene__Firehose_RSEM_log2.cct", -->
+<!--   "\t", escape_double = FALSE, trim_ws = TRUE -->
+<!-- ) -->
+
+<!-- ovarianRNAseq2T_df <-  -->
+<!--   ovarianRNAseq2_tbldf %>%  -->
+<!--   TransposeAssay() -->
+
+<!-- ovarianRNAseq2_df <- inner_join(ovarianSurv_df, ovarianRNAseq2T_df) -->
+<!-- ``` -->
+
+
+
+## AES-PCA Analysis
+Now that we have joined data, we can create an `Omics*` data container and perform the AES-PCA analysis.
+
+### Data Container
+```{r 3.3_ovRNAseqOmics}
+ovRNAseq_OmicsSurv <- CreateOmics(
+  assayData_df = ovarianRNAseq_df[, -(2:3)],
+  pathwayCollection_ls = c2cp_PC,
+  response = ovarianRNAseq_df[, 1:3],
+  respType = "survival"
+)
+
+ovRNAseq_OmicsSurv
+```
+
+### AES-PCA
+We have roughly 1300 pathways to test, and this takes about sixteen minutes in parallel. 
+```{r 3.3_ovRNAseqAESPCA}
+ovRNAseq_aespcOut <- AESPCA_pVals(
+  ovRNAseq_OmicsSurv,
+  numPCs = 1,
+  parallel = TRUE,
+  numCores = 16,
+  adjustment = "BH"
+)
+```
+<!-- 25.04 min on mac -->
+
+### Integrative Analysis
+```{r, include=FALSE}
+# Calculate the values we need for the in-line code below
+nProtSignif_int <-
+  ovProt_aespcOut$pVals_df %>%
+  filter(rawp < 0.05) %>%
+  nrow()
+
+nRNAseqSignif <- 
+  ovRNAseq_aespcOut$pVals_df %>%
+  filter(rawp < 0.05) %>%
+  nrow()
+```
+
+
+#### Intersection Method
+There are `r nProtSignif_int` nominally-significant pathways from the protein analysis, and `r nRNAseqSignif` nominally-significant pathways from the gene expression analysis. Of these, the following pathways are in common:
+```{r}
+intersect(
+  ovProt_aespcOut$pVals_df %>%
+    filter(rawp < 0.05) %>% 
+    pull(terms),
+  ovRNAseq_aespcOut$pVals_df %>%
+    filter(rawp < 0.05) %>% 
+    pull(terms)
+)
+```
+However, none of them have FDR values below 30%.
+
+#### Global-$p$ Method
+Here is the function we use to test the Cox Proportional Hazards model for each pathway:
+```{r}
+library(survival)
+
+pathSurvSignif <- function(pathway, resp1_df, omicsOut1, resp2_df, omicsOut2){
+  # browser()
+  
+  ###  Matched Data  ###
+  keptSamples <- intersect(resp1_df$sampleID, resp2_df$sampleID)
+  innerResp_df <- resp1_df %>% 
+    filter(sampleID %in% keptSamples)
+  colnames(innerResp_df)[2:3] <- c("time", "status")
+  
+  path_df <- innerResp_df %>% 
+    left_join(
+      getPathPCLs(omicsOut1, pathway)$PCs, by = "sampleID"
+    ) %>% 
+    rename(ome1 = V1) %>% 
+    left_join(
+      getPathPCLs(omicsOut2, pathway)$PCs, by = "sampleID"
+    ) %>% 
+    rename(ome2 = V1) %>% 
+    select(-sampleID)
+  
+  
+  ###  Model Fits  ###
+  # Data Set 1
+  ome1_mod <- coxph(Surv(time, status) ~ ome1, data = path_df)
+  
+  # Dat Set 2
+  ome2_mod <- coxph(Surv(time, status) ~ ome2, data = path_df)
+  
+  # Full Model
+  full_mod <- coxph(Surv(time, status) ~ ., data = path_df)
+  
+  
+  ###  Model p-Values  ###
+  ome1p <- summary(ome1_mod)$logtest["pvalue"]
+  ome2p <- summary(ome2_mod)$logtest["pvalue"]
+  fullpVal <- summary(full_mod)$logtest["pvalue"]
+  
+  
+  ###  Return  ###
+  tibble(
+    terms = pathway,
+    ome1 = ome1p,
+    ome2 = ome2p,
+    global = fullpVal
+  )
+  
+}
+```
+
+We create the two response data frames necessary:
+```{r}
+protResp_df <- tibble(
+  sampleID = getSampleIDs(ovProt_OmicsSurv),
+  time     = getEventTime(ovProt_OmicsSurv),
+  status   = getEvent(ovProt_OmicsSurv)
+)
+geneResp_df <- tibble(
+  sampleID = getSampleIDs(ovRNAseq_OmicsSurv),
+  time     = getEventTime(ovRNAseq_OmicsSurv),
+  status   = getEvent(ovRNAseq_OmicsSurv)
+)
+```
+
+Now we test the function on the *T* Cell Receptor Signalling Pathway (`BIOCARTA_TCR_PATHWAY`):
+```{r}
+pathSurvSignif(
+  pathway = "BIOCARTA_TCR_PATHWAY",
+  resp1_df = protResp_df,
+  omicsOut1 = ovProt_aespcOut,
+  resp2_df = geneResp_df,
+  omicsOut2 = ovRNAseq_aespcOut
+)
+```
+
+Once we have confirmed that the function works as expected for one pathway, we can apply it across all the pathways (so long as they are shared by both analysis results---recall that pathways are dependent on the assay, so not all pathways will have been measured for proteomics as were measured for gene expression and vice versa).
+```{r}
+measuredPaths_char <- intersect(
+  ovProt_aespcOut$pVals_df %>%
+    pull(terms),
+  ovRNAseq_aespcOut$pVals_df %>%
+    pull(terms)
+)
+
+globalp_df <- 
+  map_dfr(
+    measuredPaths_char,
+    pathSurvSignif,
+    resp1_df = protResp_df,
+    omicsOut1 = ovProt_aespcOut,
+    resp2_df = geneResp_df,
+    omicsOut2 = ovRNAseq_aespcOut
+  ) %>% 
+  rename(
+    Proteomics = ome1,
+    RNAseq = ome2
+  )
+```
+
+We add on the false discovery rate:
+```{r}
+globalp_df %>% 
+  arrange(global) %>% 
+  mutate(FDR = p.adjust(global)) %>% 
+  filter(FDR < 0.3) %>% 
+  mutate(terms = str_trunc(terms, 35)) %>% 
+  knitr::kable(digits = 4)
+```
+
+The first pathway name is truncated, but it is "Cell death signalling via NRAGE, NRIF and NADE" (`REACTOME_CELL_DEATH_SIGNALLING_VIA_NRAGE_NRIF_AND_NADE`). Before, none of the pathways were significant even at FDR < 0.3 when analyzing each type of omics data separately. Using the Global-$p$ statistic, we see the above pathways significant have FDR < 0.3. Once again, recall that the results are dependent on the PCs estimated by the elastic net algorithm (which may not be numerically unique). However, the $p$-values for these pathways are only slightly different from those in the main manuscript.
+
+<!-- However, the physiology highlighted by these pathways are still known in the literature. [Cui et al (2011)](https://doi.org/10.1371/journal.pone.0021730) implicated the Ras-independent pathway in NK cell-mediated cytotoxicity (`BIOCARTA_NKCELLS_PATHWAY`) in ovarian carcinoma. Also, [Konstantinopoulos et al (2008)](https://doi.org/10.1186/1755-8794-1-59) showed that the Erythropoietin mediated neuroprotection through NF-kB (`BIOCARTA_EPONFKB_PATHWAY`) pathway was disregulated in ovarian tumors after certain treatments. -->
+
+<!-- #### Results Comparison for WikiPathways -->
+<!-- [Oh and Li (2013)](https://doi.org/10.4049/jimmunol.1301843) showed that TGF-$\beta$ is critically related to *T* cell function (the pathway shown in the main manuscript). Using survival information as the response, we highlight the Thymic Stromal LymphoPoietin (TSLP) Signaling Pathway (WP2203), of which overexpression was recently shown to be related to poor prognosis of epithelial ovarian carcinoma ( [Xu et al., (2019)](https://doi.org/10.1042/BSR20190116) ). The Neural Crest Differentiation pathway (WP2064) has been known to be related to epithelial to mesenchymal transition in many cancers ( [Powell et al., (2013)](https://doi.org/10.1002/wsbm.1224) ), and [Tan et al., (2011)](https://doi.org/10.1016/j.canlet.2011.06.014) showed the effect of prolactin (WP2037) on ovarian cancer cells even earlier. -->
+
+Because this is the last example with these data sets, we will clean our working environment.
+```{r}
+rm(list = ls())
+```
+
+
+
+
+
+*******************************************************************************
+
+</br>
+
+# 3.4 Integrating gene expression data with experimental design information: an analysis of sex-specific pathway gene expression effects on kidney cancer
+This example is shown in our website's main vignette: <https://gabrielodom.github.io/pathwayPCA/articles/Introduction_to_pathwayPCA.html#case-study-analysis-of-studies-with-complex-designs>. However, we will show the data cleaning and processing steps here.
+
+## Gene Expression Data Import and Wrangling
+We will import the gene expression data and transpose it directly.
+```{r}
+kirpRNAseq_df <- read_delim(
+  "extdata/HiSeqV2", "\t", escape_double = FALSE, trim_ws = TRUE
+) %>% 
+  TransposeAssay()
+```
+
+## Clinical Data Import and Cleaning
+We now import the clinical data.
+```{r}
+kirpPheno_tbldf <- read_delim(
+  "extdata/KIRP_clinicalMatrix", "\t", escape_double = FALSE, trim_ws = TRUE
+)
+```
+
+We also need to create a column indicating male subjects and removing missing response information.
+```{r}
+kirpResp_df <- 
+  kirpPheno_tbldf %>% 
+  # Select and rename the columns we need
+  select(
+    Sample = sampleID,
+    time = OS.time,
+    status = OS,
+    gender
+  ) %>% 
+  # Create a male logical indicator variable
+  mutate(male = (gender == "MALE")) %>% 
+  select(-gender) %>% 
+  # Remove missing values
+  na.omit()
+
+rm(kirpPheno_tbldf)
+```
+
+
+## Joining the Data
+```{r}
+kidney_df <- inner_join(kirpResp_df, kirpRNAseq_df)
+
+kidney_df[1:5, 1:5]
+dim(kidney_df)
+```
+At this point, we repeat the same steps shown in Section 4 of our main vignette (link above).
+
+```{r, include=FALSE}
+rm(list = ls())
+```
+
+
+
+
+
+*******************************************************************************
+
+</br>
+
+# 3.5 A pathway based integrative prediction model for patient prognosis
+The example requires 100+ random subsamples for training and testing purposes. Therefore, this section will only show the code necessary to complete one random training/test data split. We invite the reader to perform other random splits of the data, but note that this can be computationally expensive.
+
+## Data Wrangling
+### Data Import and Sample Intersection
+We import the raw gene expression RNAseq - IlluminaHiSeq pancan normalized data, the log-ratio normalised proteomics data, and the clinical data:
+```{r, message=FALSE}
+# RNAseq
+coadRNAseq_tbldf <- read_delim(
+  "extdata/Human__TCGA_COADREAD__UNC__RNAseq__GA_RNA__01_28_2016__BI__Gene__Firehose_RSEM_log2.cct",
+  "\t", escape_double = FALSE, trim_ws = TRUE
+)
+
+# Proteomics
+coadProt_tbldf <- read_delim(
+  "extdata/Human__TCGA_COADREAD__VU__Proteome__Velos__01_28_2016__VU__Gene__CDAP_UnsharedPrecursorArea_r2.cct",
+  "\t", escape_double = FALSE, trim_ws = TRUE
+)
+
+# Clinical Response
+coadPheno_tbldf <- read_delim(
+  "extdata/Human__TCGA_COADREAD__MS__Clinical__Clinical__01_28_2016__BI__Clinical__Firehose.tsi",
+  "\t", escape_double = FALSE, trim_ws = TRUE
+)
+```
+
+These data tables are all in long form, so we transpose them. For the clinical data, we remove any samples with missing survival response.
+```{r}
+# RNAseq
+coadRNAseq_df <- TransposeAssay(
+  coadRNAseq_tbldf, omeNames = "firstCol"
+)
+
+# Protein
+coadProt_df <- TransposeAssay(
+  coadProt_tbldf, omeNames = "firstCol"
+)
+
+# Clinical
+coadPheno_df <-
+  TransposeAssay(
+    coadPheno_tbldf, omeNames = "firstCol"
+  ) %>%
+  mutate(
+    # These are the required names for the glmnet survival ROC function I wrote
+    time = as.numeric(overall_survival),
+    status = as.integer(status)
+  ) %>%
+  select(Sample, time, status) %>%
+  drop_na(time, status)
+```
+
+### Sample Matching
+We then find the set of samples shared across both platforms and clinical data.
+```{r}
+sharedSamples_char <- 
+  intersect(
+    coadProt_df$Sample,
+    intersect(
+      coadRNAseq_df$Sample,
+      coadPheno_df$Sample
+    )
+  )
+```
+
+We select the rows from each data set which match these samples, and we re-order the rows of the clinical data (this assumption will make our analysis faster later: we won't have to join the data by sample within each simulation replicate).
+```{r}
+coadRNAseqM_df <- 
+  coadRNAseq_df %>% 
+  filter(Sample %in% sharedSamples_char)
+dim(coadRNAseqM_df)
+coadRNAseqM_df[1:5, 1:5]
+
+coadProtM_df <- 
+  coadProt_df %>% 
+  filter(Sample %in% sharedSamples_char) %>% 
+  arrange(match(Sample, coadRNAseqM_df$Sample))
+dim(coadProtM_df)
+coadProtM_df[1:5, 1:5]
+
+coadPhenoM_df <- 
+  coadPheno_df %>% 
+  filter(Sample %in% sharedSamples_char) %>% 
+  arrange(match(Sample, coadRNAseqM_df$Sample))
+coadPhenoM_df
+```
+
+### Missing Data
+With this matched-sample data subset, we check for missing values.
+```{r}
+anyNA(coadRNAseqM_df)
+anyNA(coadProtM_df)
+```
+
+Because there are missing values in the RNAseq data, we check which genes have missingness. 
+```{r}
+badGenes_char <-
+  coadRNAseqM_df %>%
+  map_int(~sum(is.na(.x))) %>%
+  `>`(0) %>%
+  which %>%
+  names
+
+badGenes_char
+```
+
+There are not many genes with missing values (only `r length(badGenes_char)`), so we remove them rather than impute them.
+```{r}
+coadRNAseqM_df <- 
+  coadRNAseqM_df %>% 
+  select(-one_of(badGenes_char))
+```
+
+### Cleaned Data
+Now we make a list of matched dataframes, and clean up our environment:
+```{r}
+coadMatched_ls <- 
+  list(
+    clinical = coadPhenoM_df,
+    proteomics = coadProtM_df,
+    rnaSeq = coadRNAseqM_df
+  )
+
+rm(
+  coadPheno_tbldf, coadPheno_df, coadPhenoM_df,
+  coadProt_tbldf, coadProt_df, coadProtM_df,
+  coadRNAseq_tbldf, coadRNAseq_df, coadRNAseqM_df,
+  badGenes_char
+)
+```
+
+Finally, we import the chosen pathway collection: the KEGG pathways in C2 Canonical Pathways collection from MSigDB (with pathways larger than 100 genes removed).
+```{r}
+keggC2CP_PC <- read_gmt(
+  file = "extdata/c2.cp.v6.2.symbols_trimmed.gmt",
+  description = TRUE
+)
+```
+
+
+## Training-Test Data Split
+Now that we have sample-matched cross-platform data, we will partition the data into training and test subsets, and create `OmicsSurv` data containters for each.
+
+### Split Indicators
+Because the end goal is to repeat this process over hundreds of random splits, we create a list with training-data indicators for each of the replicates. Because this process could take more than a day, we set the date of the simulation as the date we started. (*For the purpose of this document, we will set the number of runs to 1, but we normally set it at 100 or 500.*)
+```{r}
+date_char <- format(Sys.Date(), "%Y%m%d")
+nRuns <- 1
+labels_char <- rep_along(sharedSamples_char, c(TRUE, FALSE))
+
+samples_ls <- 
+  rerun(
+    .n = nRuns,
+    {
+      tibble(
+        Sample = sharedSamples_char,
+        Train  = sample(labels_char, replace = FALSE)
+      )
+    }
+  )
+names(samples_ls) <- str_pad(
+  as.character(seq_len(nRuns)),
+  width = 3, side = "left", pad = "0"
+)
+```
+
+### Data Containers and AESPCA Calls
+For each set of training-test splits, we will store the centering and scaling vectors (for the prediction step later) and then create the data containers. Once we have these, we will execute AESPCA on the training data. Because these steps can be time consuming, we recommend saving the intermediate results from each run within the `for()` loop.
+```{r bigForLoop}
+for (run in seq_len(nRuns)) {
+  
+  ###  Setup  ###
+  run_char <- names(samples_ls)[run]
+  samples_df <- samples_ls[[run]]
+  # res_dir <- paste0(
+  #   "<YOUR PATH HERE>/tcga_coad_surv_results_run_", run_char
+  # )
+  # dir.create(res_dir)
+  
+  
+  ###  Split Index  ###
+  train_logi <- samples_df$Train
+  trainResp_df <- 
+    coadMatched_ls$clinical[train_logi, ]
+  
+  
+  ###  Store Centring and Scaling Vectors  ###
+  centerAndScale_ls <- list(
+    protCenter = colMeans(
+      coadMatched_ls$proteomics[train_logi, -1]
+    ),
+    protScale = apply(
+      coadMatched_ls$proteomics[train_logi, -1], MARGIN = 2, FUN = sd
+    ),
+    rnaSeqCenter = colMeans(
+      coadMatched_ls$rnaSeq[train_logi, -1]
+    ),
+    rnaSeqScale = apply(
+      coadMatched_ls$rnaSeq[train_logi, -1], MARGIN = 2, FUN = sd
+    )
+  )
+  
+  
+  ###  Create Omics Data Containers  ###
+  protTrain_OmicsSurv <- CreateOmics(
+    assayData_df = coadMatched_ls$proteomics[train_logi, ],
+    pathwayCollection_ls = keggC2CP_PC,
+    response = trainResp_df,
+    respType = "surv"
+  )
+  rnaSeqTrain_OmicsSurv <- CreateOmics(
+    assayData_df = coadMatched_ls$rnaSeq[train_logi, ],
+    pathwayCollection_ls = keggC2CP_PC,
+    response = trainResp_df,
+    respType = "surv"
+  )
+  
+  
+  ###  AES-PCA  ###
+  # Each step takes a while:
+  # 4.8 min on FIU PC; 5.9 on UM PC; 12.1 on mac
+  protTrain_aespcOut <- AESPCA_pVals(
+    protTrain_OmicsSurv,
+    parallel = TRUE,
+    numCores = 16,
+    adjustment = "BH"
+  ) 
+  rnaSeqTrain_aespcOut <- AESPCA_pVals(
+    rnaSeqTrain_OmicsSurv,
+    parallel = TRUE,
+    numCores = 16,
+    adjustment = "BH"
+  )
+  
+  
+  ###  Compile Results  ###
+  trainingData_ls <- list(
+    trainingIDs = samples_df,
+    response_df = trainResp_df
+  )
+  coadProtTrainResults_ls <- list(
+    aespcaRes_ls = protTrain_aespcOut,
+    cs_ls = centerAndScale_ls[c("protCenter", "protScale")]
+  )
+  coadRNAseqTrainResults_ls <- list(
+    aespcaRes_ls = rnaSeqTrain_aespcOut,
+    cs_ls = centerAndScale_ls[c("rnaSeqCenter", "rnaSeqScale")]
+  )
+  
+  
+  ###  Save  ###
+  # saveRDS(
+  #   trainingData_ls,
+  #   file = paste0(
+  #     res_dir, "/pathwayPCA_tcga_coad_trainMeta_res_", date_char, ".RDS"
+  #   )
+  # )
+  # saveRDS(
+  #   coadProtTrainResults_ls,
+  #   file = paste0(
+  #     res_dir, "/pathwayPCA_tcga_coad_protTrain_res_", date_char, ".RDS"
+  #   )
+  # )
+  # saveRDS(
+  #   coadRNAseqTrainResults_ls,
+  #   file = paste0(
+  #     res_dir, "/pathwayPCA_tcga_coad_rnaSeqTrain_res_", date_char, ".RDS"
+  #   )
+  # )
+  
+}
+```
+
+Because we have created a lot of extra objects for this process, let's clean up the environment.
+```{r}
+rm(
+  labels_char, sharedSamples_char,
+  samples_df, trainResp_df,
+  protTrain_OmicsSurv, protTrain_aespcOut,
+  rnaSeqTrain_OmicsSurv, rnaSeqTrain_aespcOut,
+  centerAndScale_ls, train_logi
+)
+```
+
+
+## Build Training-Data Design Matrices
+We now have `pathwayPCA` results for both platforms, so we want to create design matrices to train the Survival GLMNET model. **From this point on, we will assume that you are working within an individual replicate of a `for()` loop, other than to define functions.**
+
+### Extract Designs
+We first create a helper function to extract a design and response matrix from the `pathwayPCA` output.
+```{r}
+ExtractDesign <- function(aespcaResults_ls,
+                          response_df, 
+                          platform = c("prot", "gene")){
+  # Input:
+  #   - aespcaResults_ls: the output of the  AESPCA_pVals() function
+  #   - response_df: the data frame of survival information
+  #   - platform: tag indicating if the results are from proteomics or RNAseq
+  # Output: a data frame with the survival information and principal component
+  #   vectors from each pathway.
+  
+  design_df <- bind_cols(aespcaResults_ls$PCs_ls)
+  colnames(design_df) <- paste(
+    names(aespcaResults_ls$PCs_ls), platform, sep = "_"
+  )
+  bind_cols(
+    response_df,
+    design_df
+  )
+  
+}
+```
+
+We then create the design matrices that compile the pathway principal components from each platform.
+```{r}
+protPCs_df <- ExtractDesign(
+  aespcaResults_ls = coadProtTrainResults_ls$aespcaRes_ls,
+  response_df = trainingData_ls$response_df,
+  platform = "prot"
+)
+
+rnaSeqPCs_df <- ExtractDesign(
+  aespcaResults_ls = coadRNAseqTrainResults_ls$aespcaRes_ls,
+  response_df = trainingData_ls$response_df,
+  platform = "gene"
+)
+```
+
+### Remove Noisy Pathway Principal Components
+We already know that some of these pathways will not be related to the survival rates of colon cancer. Moreover, we have pathway-specific $p$-values from a Cox Proportional Hazards model. Therefore, we can rank the pathway principal components by their $p$-values and retain all in the top, say 200 (this number can obviously be adjusted, but remember to adhere to the recommended practices of the Elastic-Net; because there are only 34 training observation, the number of features in the design space should not be too large).
+
+We first create the vectors of pathway-specific $p$-values.
+```{r}
+protPVs <- coadProtTrainResults_ls$aespcaRes_ls$pVals_df$rawp
+names(protPVs) <- paste0(
+  coadProtTrainResults_ls$aespcaRes_ls$pVals_df$pathways, "_prot"
+)
+
+genePVs <- coadRNAseqTrainResults_ls$aespcaRes_ls$pVals_df$rawp
+names(genePVs) <- paste0(
+  coadRNAseqTrainResults_ls$aespcaRes_ls$pVals_df$pathways, "_gene"
+)
+
+allPVs <- sort(c(protPVs, genePVs))
+```
+
+From the output of the `AESPCA_pVals()` function, these $p$-values are already sorted in increasing order. We now cut to the top pathways within each platform and across both.
+```{r}
+keptPaths_idx <- seq_len(200)
+
+keepProtPCs <- names(protPVs[keptPaths_idx])
+keepGenePCs <- names(genePVs[keptPaths_idx])
+keepAllPCs  <- names(allPVs[keptPaths_idx])
+```
+
+Finally, we create the design matrices for each platform and for their combination.
+```{r, warning=FALSE}
+protDesign_df <- protPCs_df %>% 
+  select(Sample, time, status, one_of(keepProtPCs))
+rnaSeqDesign_df <- rnaSeqPCs_df %>% 
+  select(Sample, time, status, one_of(keepGenePCs))
+
+combinedDesign_df <- bind_cols(
+  protPCs_df %>%
+    select(Sample, time, status, one_of(keepAllPCs)),
+  rnaSeqPCs_df %>%
+    select(one_of(keepAllPCs))
+)
+```
+
+Each of the three design matrices are the same dimension:
+```{r}
+ncol(protDesign_df); ncol(rnaSeqDesign_df); ncol(combinedDesign_df)
+
+# Clean up
+rm(
+  protPVs, genePVs, allPVs, keptPaths_idx, 
+  protPCs_df, rnaSeqPCs_df
+)
+```
+
+Finally, because we are assuming that this process is being replicated hundreds of times, we will also save this set of intermediary results.
+```{r}
+# write_csv(
+#   protDesign_df,
+#   path = paste0(
+#     res_dir,
+#     "/tcga_coad_protTrain_Design_nKpt", nKept, "_",
+#     resDate_char, ".csv"
+#   )
+# )
+# 
+# write_csv(
+#   rnaSeqDesign_df,
+#   path = paste0(
+#     res_dir,
+#     "/tcga_coad_rnaSeqTrain_Design_nKpt", nKept, "_",
+#     resDate_char, ".csv"
+#   )
+# )
+# 
+# write_csv(
+#   combinedDesign_df,
+#   path = paste0(
+#     res_dir,
+#     "/tcga_coad_protRNAseqTrain_Design_nKpt", nKept, "_",
+#     resDate_char, ".csv"
+#   )
+# )
+```
+
+
+## Project the Test Data
+We have a training design matrix for each platform. Now, we want to load the test data onto these PCs. First we set the test data sample indices.
+```{r}
+test_logi <- !trainingData_ls$trainingIDs$Train
+```
+
+
+### Load Proteomics Test Data onto Training-Data PCs
+We use the `pathwayPCA` function `LoadOntoPCs()` to project the training data, pathway-specific, onto their respective principal components.
+```{r}
+protTest_df <-
+  # Select the test samples
+  coadMatched_ls$proteomics[test_logi, -1] %>%
+  # Center and scale them to the training data, resulting in a matrix
+  scale(
+    center = coadProtTrainResults_ls$cs_ls$protCenter,
+    scale  = coadProtTrainResults_ls$cs_ls$protScale
+  ) %>% 
+  # Transform back into a data frame and append the sample IDs
+  as_tibble() %>% 
+  bind_cols(
+    coadMatched_ls$proteomics[test_logi, 1],
+    .
+  ) %>% 
+  # Project the test data onto each pathway PC
+  LoadOntoPCs(
+    loadings_ls = coadProtTrainResults_ls$aespcaRes_ls$loadings_ls
+  ) %>% 
+  # Remove the sample IDs (we kept the rows in the appropriate order)
+  select(-SampleID)
+
+colnames(protTest_df) <- paste(colnames(protTest_df), "prot", sep = "_")
+
+protTest_df <-
+  coadMatched_ls$clinical %>% 
+  filter(test_logi) %>% 
+  bind_cols(protTest_df) %>% 
+  select(Sample, time, status, one_of(keepProtPCs))
+```
+
+### Load Gene Expression Test Data onto Training-Data PCs
+We repeat the above process for gene expression data.
+```{r}
+rnaSeqTest_df <- 
+  coadMatched_ls$rnaSeq[test_logi, -1] %>%
+  scale(
+    center = coadRNAseqTrainResults_ls$cs_ls$rnaSeqCenter,
+    scale  = coadRNAseqTrainResults_ls$cs_ls$rnaSeqScale
+  ) %>% 
+  as_tibble() %>% 
+  bind_cols(
+    coadMatched_ls$rnaSeq[test_logi, 1],
+    .
+  ) %>% 
+  LoadOntoPCs(
+    loadings_ls = coadRNAseqTrainResults_ls$aespcaRes_ls$loadings_ls
+  ) %>% 
+  select(-SampleID)
+
+colnames(rnaSeqTest_df) <- paste(colnames(rnaSeqTest_df), "gene", sep = "_")
+
+rnaSeqTest_df <- 
+  coadMatched_ls$clinical %>% 
+  filter(test_logi) %>% 
+  bind_cols(rnaSeqTest_df) %>% 
+  select(Sample, time, status, one_of(keepGenePCs))
+```
+
+### Combine Test Data across Platforms
+We also create the cross-platform test data.
+```{r, warning=FALSE}
+combinedTest_df <- bind_cols(
+  protTest_df %>%
+    select(Sample, time, status, one_of(keepAllPCs)),
+  rnaSeqTest_df %>%
+    select(one_of(keepAllPCs))
+)
+```
+
+At this point, we would save another round of intermediary results.
+```{r}
+# write_csv(
+#   protTest_df,
+#   path = paste0(
+#     res_dir,
+#     "/tcga_coad_protTest_Design_nKpt", nKept, "_",
+#     resDate_char, ".csv"
+#   )
+# )
+# write_csv(
+#   rnaSeqTest_df,
+#   path = paste0(
+#     res_dir,
+#     "/tcga_coad_rnaSeqTest_Design_nKpt", nKept, "_",
+#     resDate_char, ".csv"
+#   )
+# )
+# write_csv(
+#   combinedTest_df,
+#   path = paste0(
+#     res_dir,
+#     "/tcga_coad_protRNAseqTest_Design_nKpt", nKept, "_",
+#     resDate_char, ".csv"
+#   )
+# )
+```
+
+
+## Survival GLMNET Prediction
+
+### Helper Functions
+#### `ElasticNetReduce()`
+We need a function to estimate the elastic net and identify the necessary features "caught" in this net.
+```{r}
+ElasticNetReduce <- function(fullTrain_df, fullTest_df){
+  # Input:
+  #   - fullTrain_df: a data frame of the survival time and event status (named
+  #       "time" and "status" exactly) and the PCs from the top 200 most
+  #       significant pathways and NO OTHER COLUMNS (this function uses column
+  #       index positions for subsetting).
+  #   - fullTest_df: a data frame of the same format as fullTrain_df
+  #
+  # Output: a list of three components:
+  #   - redTrain: a data frame with survival time, event status, and pathway PCs
+  #       selected by the elastic net from the training data
+  #   - redTest: a data frame with the same format as redTrain
+  #   - modelBetas: the pathway PC coefficients from the glmnet of best fit
+  
+  ###  Train CoxPH Elastic Net  ###
+  require(glmnet)
+  # The results of the cv.glmnet() are highly variable, so we repeat the model
+  #   fit and find the best results.
+  fits_ls <- map(
+    .x = 1:10,
+    .f = ~{
+      cv.glmnet(
+        as.matrix(fullTrain_df[, -(1:2)]),
+        Surv(fullTrain_df$time, fullTrain_df$status),
+        family = "cox", alpha = 0.5
+      )
+    }
+  )
+  
+  
+  ###  Best-Fitting Model  ###
+  # Average of all of the mean cross-validated errors at each lambda
+  meanCVE <- fits_ls %>% 
+    map("cvm") %>% 
+    map(t) %>% 
+    do.call(rbind, .) %>% 
+    colMeans()
+  
+  # Note that lambda values are fixed beforehand, so the lambda values for one
+  #   model will be identical to the lambda values for all the others. This also
+  #   means that once we pick a lambda, the features selected as significant
+  #   will not change across model fits
+  bestLambda <- fits_ls[[1]]$lambda[which.min(meanCVE)]
+  betas_df <- summary(coef(fits_ls[[1]], s = bestLambda))[, -2]
+  
+  
+  ###  Train and Test Data Subsets  ###
+  # If the elastic-net returns no predictors, then betas_df will have 0 rows.
+  # If we have no predictors in the model, we need to find the model with the
+  #   next smallest set of predictors:
+  if(nrow(betas_df) == 0){
+    
+    idx <- 2
+    while(nrow(betas_df) == 0){
+      
+      betas_df <- summary(
+        coef(fits_ls[[1]], s = fits_ls[[1]]$lambda[idx])
+      )[, -2]
+      idx <- idx + 1
+      
+    }
+    
+  } 
+  
+  # Now that we have a set of betas, we extract the pathway columns matching
+  #   the features retained by the elastic net.
+  redTrain_df <- fullTrain_df[, c(1, 2, betas_df$i + 2)]
+  redTest_df  <- fullTest_df[, c(1, 2, betas_df$i + 2)]
+  
+  
+  ###  Return  ###
+  list(
+    redTrain = redTrain_df,
+    redTest = redTest_df,
+    modelBetas = betas_df$x
+  )
+  
+}
+```
+
+We test the function (because this function is internal, it assumes that we have already removed the sample IDs):
+```{r}
+reducedProtData_ls <- ElasticNetReduce(
+  fullTrain_df = protDesign_df[, -1],
+  fullTest_df = protTest_df[, -1]
+)
+
+reducedProtData_ls
+```
+It is worth noting that principal components are unique up to a sign, so we may see positive or negative values for the $\boldsymbol\beta$ calculated by the GLMNET.
+
+#### `PredictCoxSurvival()`
+Given reduced training and test data, we predict survival.
+```{r}
+PredictCoxSurvival <- function(reducedTrain_df, reducedTest_df, modelCoeff_num,
+                               predictor = "lp"){
+  # Input:
+  #   - reducedTrain_df: the "redTrain" object returned by ElasticNetReduce()
+  #   - reducedTest_df: the "redTest" object returned by ElasticNetReduce()
+  #   - modelCoeff_num: the "modelBetas" object returned by ElasticNetReduce()
+  #   - predictor: the type of predictor, as passed to the predict.coxph()
+  #       function. Options are "lp", "risk", "expected", "terms", "survival".
+  #       Defaults to the linear predictor. See ?predict.coxph, argument "type"
+  #       for more details.
+  #
+  # Output: a list of two data frames (one for training data, one for test) with
+  #   observed survival time and status paired with predicted survival time
+  
+  ###  Train Reduced Cox PH Model  ###
+  # We pass in the intial values for beta and "iter = 0" to train the model
+  #   exactly as it was returned by the GLMNET. See
+  # https://r.789695.n4.nabble.com/estimating-survival-times-with-glmnet-and-coxph-td4614225.html
+  coxph_train <- coxph(
+    Surv(time, status) ~ .,
+    data = reducedTrain_df,
+    init = modelCoeff_num,
+    iter = 0
+  )
+  
+  ###  Predictions  ###
+  # Obtain the linear predictor from the training data
+  trainPred <- predict(coxph_train, type = predictor)
+  
+  # predict on the test data
+  testSurvCols <- which(colnames(reducedTest_df) %in% c("time", "status"))
+  testPred <- predict(
+    coxph_train,
+    newdata = reducedTest_df[, -testSurvCols],
+    type = predictor
+  )
+  
+  ###  Return  ###
+  list(
+    trainPrediction = data.frame(
+      reducedTrain_df[, c("time", "status")],
+      predicted = trainPred
+    ),
+    testPrediction = data.frame(
+      reducedTest_df[, c("time", "status")],
+      predicted = testPred
+    )
+  )
+  
+}
+```
+
+We test this function on the output returned by the `ElasticNetReduce()` function above. See the `predict.coxph()` manual files for more details.
+```{r}
+predProtSurv_ls <- PredictCoxSurvival(
+  reducedTrain_df = reducedProtData_ls$redTrain,
+  reducedTest_df = reducedProtData_ls$redTest,
+  modelCoeff_num = reducedProtData_ls$modelBetas
+)
+```
+
+#### `WrangleTimeROC()`
+Now that we have a set of relative risks from the Cox Proportional Hazards predicton, we can predict survival at different times.
+```{r}
+WrangleTimeROC <- function(testPred_df, timePts = 8, pctile = 0.8){
+  # Input:
+  #   - testPred_df: the "testPrediction" data frame returned by the
+  #       PredictCoxSurvival() function
+  #   - timePts: number of time points to predict survival and calculate ROC
+  #   - pctile: calculate ROC up to this percent of the subjects. Because
+  #       survival times often have long tails, this should be somewhere less
+  #       than 90%.
+  #
+  # Output: a data frame of the time points, the true positives and false 
+  #   positives at that time point (TP and FP, respectively), and the AUC value
+  #   for the prediction at that time point.
+  
+  require(timeROC)
+  
+  timeSteps <- quantile(
+    testPred_df$time,
+    probs = seq(0, pctile, length.out = timePts + 1)[-1]
+  )
+  
+  # The help file states that higher marker values are assumed to be related to
+  #   *lower* survival values. We observed that our predicted risk values have
+  #   the opposite interpretation. Therefore, we set the marker to -1 times its
+  #   true predicted value.
+  data_sROC <- timeROC(
+    T = testPred_df$time,
+    delta = testPred_df$status,
+    marker = -testPred_df$predicted,
+    times = timeSteps,
+    cause = 1,
+    weighting = "cox"
+  )
+  
+  dataSROC_ls <- list(
+    tp_df = data_sROC$TP %>%
+      as_tibble() %>%
+      gather(key = "time", value = "TP"),
+    fp_df = data_sROC$FP %>%
+      as_tibble() %>%
+      gather(key = "time", value = "FP") %>% 
+      select(FP),
+    auc_df = tibble(
+      time = names(data_sROC$AUC),
+      auc  = data_sROC$AUC
+    )
+  )
+  
+  dataSROC_ls$tp_df %>% 
+    bind_cols(dataSROC_ls$fp_df) %>% 
+    left_join(dataSROC_ls$auc_df) %>% 
+    mutate(time = str_remove(time, "t=")) %>% 
+    mutate(time = as.numeric(time))
+  
+}
+```
+
+We test this function.
+```{r}
+WrangleTimeROC(
+  testPred_df = predProtSurv_ls$testPrediction
+)
+```
+
+#### The Wrapper Function
+Now that we have these three internal functions, we wrap them.
+```{r}
+GlmnetSurvivalROC <- function(train_df, test_df, predictor_char = "lp", ...){
+  # Input:
+  #   - train_df: a data frame of the survival time and event status (named
+  #       "time" and "status" exactly) and the PCs from the top 200 most
+  #       significant pathways and NO OTHER COLUMNS (this function uses column
+  #       index positions for subsetting).
+  #   - test_df: a data frame of the same format as fullTrain_df
+  #   - predictor: the type of predictor, as passed to the predict.coxph()
+  #       function. Options are "lp", "risk", "expected", "terms", "survival".
+  #       Defaults to the linear predictor. See ?predict.coxph, argument "type"
+  #       for more details.
+  #   - ...: dots for additional arguments to the WrangleTimeROC() function
+  #
+  # Output: a list of two components:
+  #   - predictorCount_df: a data frame counting the number of pathways used
+  #       to predict survival outcome by protein (nProteinPaths) or gene
+  #       expression (nRNAseqPaths). If you supply a combined design matrix with
+  #       both RNAseq and proteomics data, this will count how many pathways
+  #       from each platform were "captured" by the elastic net.
+  #   - survivalROC_df: a data frame of the time points, the true positives and
+  #       false positives at that time point (TP and FP, respectively), and the
+  #       AUC value for the prediction at that time point.
+  #
+  # Details: this is a wrapper function for the ElasticNetReduce(),
+  #   PredictCoxSurvival(), and WrangleTimeROC() functions.
+  
+  redData_ls <- ElasticNetReduce(
+    fullTrain_df = train_df,
+    fullTest_df  = test_df
+  )
+  keptPathTypes_char <- str_split(
+    colnames(redData_ls$redTest[, -(1:2)]),
+    pattern = "_"
+  ) %>% 
+    map_chr(2)
+    
+  
+  predSurv_ls <- PredictCoxSurvival(
+    reducedTrain_df = redData_ls$redTrain,
+    reducedTest_df  = redData_ls$redTest,
+    modelCoeff_num  = redData_ls$modelBetas,
+    predictor       = predictor_char
+  )
+  
+  aucOut_df <- WrangleTimeROC(
+    testPred_df = predSurv_ls$testPrediction, ...
+  )
+  
+  list(
+    predictorCount_df = tibble(
+      nProteinPaths = sum(keptPathTypes_char == "prot"),
+      nRNAseqPaths  = sum(keptPathTypes_char == "gene")
+    ),
+    survivalROC_df = aucOut_df
+  )
+  
+}
+```
+
+And we finally test the wrapper function.
+```{r}
+GlmnetSurvivalROC(
+  train_df = protDesign_df[, -1],
+  test_df = protTest_df[, -1],
+  timePts = 6
+)
+```
+
+
+### Elastic-Net Results
+We have all of the functions we need to predict survival times for the three platforms.
+```{r, message=FALSE}
+# Proteomics
+protROC_ls <- 
+  GlmnetSurvivalROC(
+    train_df = protDesign_df[, -1],
+    test_df  = protTest_df[, -1],
+    timePts = 12
+  )
+
+# RNAseq
+rnaSeqROC_ls <- 
+  GlmnetSurvivalROC(
+    train_df = rnaSeqDesign_df[, -1],
+    test_df  = rnaSeqTest_df[, -1],
+    timePts = 12
+  )
+
+# Combined
+comboROC_ls <- 
+  GlmnetSurvivalROC(
+    train_df = combinedDesign_df[, -1],
+    test_df  = combinedTest_df[, -1],
+    timePts = 12
+  )
+```
+
+We can inspect how many protein and RNAseq pathways were selected in the GLMNET for this particular random training-test split:
+```{r}
+comboROC_ls$predictorCount_df
+```
+
+We can also look at the prediction accuracy over time. First we create a data frame with all of the AUC values for each platform:
+```{r}
+timeAUC_df <- 
+  list(
+    prot = protROC_ls,
+    gene = rnaSeqROC_ls,
+    combo = comboROC_ls
+  ) %>% 
+  map_dfr(2, .id = "platform") %>% 
+  select(-TP, -FP) %>% 
+  arrange(time)
+```
+
+Now for a graph:
+```{r}
+ggplot(timeAUC_df) +
+  theme_bw() + 
+  aes(x = time, y = auc, group = platform, colour = platform) +
+  labs(title = "Time-Dependent AUC for Survival Prediction") + 
+  geom_line()
+```
+
+At this point, we would repeat this entire process a few hundred times and inspect the results for different random training and test partitions of the data.
