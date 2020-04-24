@@ -7,7 +7,7 @@ The paper is currently being revised for a resubmission to [PROTEOMICS](https://
 
 
 ## Reports
-The main workflow document is written as a single report. We provide the rendered report in both MS Word (.docx) and Webpage (.html) forms. The packages you will need to replicate this work are:
+The main workflow document is written as a single report. The user guides for this package are hosted on [our package website](https://gabrielodom.github.io/pathwayPCA/). We provide the rendered report in both MS Word (.docx) and Webpage (.html) forms. The packages you will need to replicate this work are:
 
 - [`pathwayPCA`](https://doi.org/10.18129/B9.bioc.pathwayPCA) (Bioconductor)
 - [`tidyverse`](https://www.tidyverse.org/) (CRAN)
