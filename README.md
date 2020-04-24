@@ -22,5 +22,5 @@ Some of the computing takes a bit of time. On a 2016 MacBook Pro, the entire rep
 ## Data
 **Assays:** The raw data files for these examples are too large to store on GitHub. Please check the `README.txt` file in `extdata/` for names, descriptions, and hyperlinks to the data files. Download these data files (**with no changes**) to your local copy of this `extdata/` directory (the report uses relative file paths for data import). The workflow manuscript contains all code necessary for data pre-processing and sample matching. If you pre-process the data in your own way, we can not claim that you will get similar results to what we have shown. 
 
-**Pathway Collections:** We provide the pathway collections we used for analysis. You can use your own, but the results will likely be different (this is *pathway* PCA after all).
+**Pathway Collections:** We provide the pathway collections we used for analysis. You can use your own, but the results will likely be different (this is *pathway* PCA after all, the choice of pathway collection is important).
 
