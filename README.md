@@ -7,7 +7,7 @@ The paper is currently being revised for a resubmission to [PROTEOMICS](https://
 
 
 ## Reports
-The main workflow document is written as a single report. The user guides for this package are hosted on [our package website](https://gabrielodom.github.io/pathwayPCA/). We provide the rendered report in both MS Word (.docx) and Webpage (.html) forms. The packages you will need to replicate this work are:
+The main workflow document is written as a single report. The user guides for this package are hosted on [our package website](https://gabrielodom.github.io/pathwayPCA/). We provide the rendered report in both MS Word (.docx) and Webpage (.html) forms (**if your browser does not render the .html file automatically, you can view it [at this link](https://htmlpreview.github.io/?https://github.com/TransBioInfoLab/pathwayPCA_PROTEOMICS_Supplement/blob/master/pathwayPCA_workflow_examples_20200422.html)**). The packages you will need to replicate this work are:
 
 - [`pathwayPCA`](https://doi.org/10.18129/B9.bioc.pathwayPCA) (Bioconductor)
 - [`tidyverse`](https://www.tidyverse.org/) (CRAN)
